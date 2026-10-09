@@ -1,6 +1,7 @@
 package mdoc
 
 import (
+	"bytes"
 	"crypto/ecdsa"
 	"crypto/ed25519"
 	"crypto/elliptic"
@@ -173,6 +174,77 @@ func TestComputeVerifyDeviceMAC(t *testing.T) {
 	}
 	if err := VerifyDeviceMAC(f.signed, f.devicePub, f.readerPriv, f.st, testDeviceDocType); err != nil {
 		t.Fatalf("VerifyDeviceMAC: %v", err)
+	}
+}
+
+// testSharedSecret is the ECKA-DH shared secret between priv and pub,
+// as a platform key store's own key agreement returns it.
+func testSharedSecret(t *testing.T, priv *ecdsa.PrivateKey, pub *ecdsa.PublicKey) []byte {
+	t.Helper()
+	ecdhPriv, err := priv.ECDH()
+	if err != nil {
+		t.Fatalf("private key to ECDH: %v", err)
+	}
+	ecdhPub, err := pub.ECDH()
+	if err != nil {
+		t.Fatalf("public key to ECDH: %v", err)
+	}
+	z, err := ecdhPriv.ECDH(ecdhPub)
+	if err != nil {
+		t.Fatalf("ECDH: %v", err)
+	}
+	return z
+}
+
+func TestComputeDeviceMACFromSharedSecretMatchesComputeDeviceMAC(t *testing.T) {
+	f := newMACFixture(t)
+	z := testSharedSecret(t, f.devicePriv, f.readerPub)
+	fromSecret, err := ComputeDeviceMACFromSharedSecret(z, f.st, testDeviceDocType, testDeviceNameSpaces())
+	if err != nil {
+		t.Fatalf("ComputeDeviceMACFromSharedSecret: %v", err)
+	}
+	if fromSecret.AuthType != DeviceAuthMAC {
+		t.Errorf("AuthType = %d, want DeviceAuthMAC", fromSecret.AuthType)
+	}
+	if !bytes.Equal(fromSecret.DeviceAuth, f.signed.DeviceAuth) {
+		t.Errorf("DeviceAuth differs from ComputeDeviceMAC's for the same inputs")
+	}
+	want, err := f.signed.Marshal()
+	if err != nil {
+		t.Fatalf("marshal ComputeDeviceMAC's: %v", err)
+	}
+	got, err := fromSecret.Marshal()
+	if err != nil {
+		t.Fatalf("marshal ComputeDeviceMACFromSharedSecret's: %v", err)
+	}
+	if !bytes.Equal(got, want) {
+		t.Errorf("DeviceSigned differs from ComputeDeviceMAC's for the same inputs")
+	}
+}
+
+func TestComputeDeviceMACFromSharedSecretVerifies(t *testing.T) {
+	f := newMACFixture(t)
+	// The reader side of the agreement gives the same Z.
+	z := testSharedSecret(t, f.readerPriv, f.devicePub)
+	signed, err := ComputeDeviceMACFromSharedSecret(z, f.st, testDeviceDocType, testDeviceNameSpaces())
+	if err != nil {
+		t.Fatalf("ComputeDeviceMACFromSharedSecret: %v", err)
+	}
+	if err := VerifyDeviceMAC(signed, f.devicePub, f.readerPriv, f.st, testDeviceDocType); err != nil {
+		t.Fatalf("VerifyDeviceMAC: %v", err)
+	}
+	_, otherDevicePub := testP256KeyPair(t)
+	if err := VerifyDeviceMAC(signed, otherDevicePub, f.readerPriv, f.st, testDeviceDocType); err == nil {
+		t.Errorf("VerifyDeviceMAC accepted the wrong device key")
+	}
+}
+
+func TestComputeDeviceMACFromSharedSecretRejectsBadLength(t *testing.T) {
+	st := testSessionTranscriptBytes(t)
+	for _, n := range []int{0, 31, 33, 48} {
+		if _, err := ComputeDeviceMACFromSharedSecret(make([]byte, n), st, testDeviceDocType, testDeviceNameSpaces()); err == nil {
+			t.Errorf("accepted a %d-byte shared secret", n)
+		}
 	}
 }
 
