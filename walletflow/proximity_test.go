@@ -2,11 +2,15 @@ package walletflow_test
 
 import (
 	"context"
+	"crypto/ecdh"
+	"crypto/ecdsa"
 	"crypto/x509"
 	"errors"
+	"fmt"
 	"testing"
 	"time"
 
+	"github.com/idfoundry/oid4vcgo/credential/mdoc"
 	"github.com/idfoundry/oid4vcgo/proximity"
 	"github.com/idfoundry/oid4vcgo/walletflow"
 	"github.com/idfoundry/oid4vcgo/walletflow/walletflowtest"
@@ -238,4 +242,111 @@ func TestProximityPresentationEnds(t *testing.T) {
 			t.Errorf("Send = %x", ev.Send)
 		}
 	})
+}
+
+// agreeingKeys is a KeyStore whose keys also agree keys
+// (proximity.KeyAgreer), or refuse to with proximity.ErrNoKeyAgreement
+// when signOnly: a hardware key created for signing only.
+type agreeingKeys struct {
+	*walletflow.MemoryKeyStore
+	signOnly bool
+	agreed   int
+}
+
+// ecdhKey is a MemoryKeyStore key: an *ecdsa.PrivateKey underneath.
+type ecdhKey interface {
+	ECDH() (*ecdh.PrivateKey, error)
+}
+
+type agreeingKey struct {
+	walletflow.Key
+	s *agreeingKeys
+}
+
+func (s *agreeingKeys) NewKey(ctx context.Context, purpose walletflow.KeyPurpose) (walletflow.Key, error) {
+	k, err := s.MemoryKeyStore.NewKey(ctx, purpose)
+	if err != nil {
+		return nil, err
+	}
+	return agreeingKey{k, s}, nil
+}
+
+func (s *agreeingKeys) Key(ctx context.Context, id string) (walletflow.Key, error) {
+	k, err := s.MemoryKeyStore.Key(ctx, id)
+	if err != nil {
+		return nil, err
+	}
+	return agreeingKey{k, s}, nil
+}
+
+func (k agreeingKey) Agree(peer *ecdsa.PublicKey) ([]byte, error) {
+	if k.s.signOnly {
+		return nil, fmt.Errorf("test key: %w", proximity.ErrNoKeyAgreement)
+	}
+	k.s.agreed++
+	priv, err := k.Key.(ecdhKey).ECDH()
+	if err != nil {
+		return nil, err
+	}
+	pub, err := peer.ECDH()
+	if err != nil {
+		return nil, err
+	}
+	return priv.ECDH(pub)
+}
+
+// With ProximityDeviceMACPreferred, a holder key that agrees keys
+// answers with deviceMac; one that can't, or a wallet left at the
+// default, signs.
+func TestProximityPresentationDeviceAuth(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		auth     walletflow.ProximityDeviceAuth
+		signOnly bool
+		want     mdoc.DeviceAuthType
+	}{
+		{"MAC preferred", walletflow.ProximityDeviceMACPreferred, false, mdoc.DeviceAuthMAC},
+		{"MAC preferred, sign-only key", walletflow.ProximityDeviceMACPreferred, true, mdoc.DeviceAuthSignature},
+		{"default", walletflow.ProximityDeviceSignature, false, mdoc.DeviceAuthSignature},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newFixture(t, walletflowtest.Options{})
+			keys := &agreeingKeys{MemoryKeyStore: f.keys, signOnly: tc.signOnly}
+			reader := newMdocReader(t)
+			w, err := walletflow.New(walletflow.Config{
+				ClientID: walletflowtest.ClientID, RedirectURI: walletflowtest.RedirectURI, IssuerRoots: f.env.IssuerRoots,
+				MdocReaderRoots: reader.roots, Development: true, ProximityDeviceAuth: tc.auth,
+			}, walletflow.Dependencies{Keys: keys, Credentials: f.store, Provider: f.env.Provider, HTTP: f.env.HTTP})
+			if err != nil {
+				t.Fatal(err)
+			}
+			mdocID := heldMdoc(t, receive(t, f, w, walletflowtest.MdocConfigurationID))
+			ctx := context.Background()
+			p, err := w.StartProximityPresentation()
+			if err != nil {
+				t.Fatal(err)
+			}
+			r, msg := proximityRequest(t, p, &reader)
+			if ev := p.HandleMessage(ctx, msg); !ev.Request {
+				t.Fatalf("event %+v", ev)
+			}
+			presented, err := p.Respond(ctx, 0, mdocID, familyName())
+			if err != nil {
+				t.Fatal(err)
+			}
+			v, err := r.Verify(presented.Send, f.env.IssuerRoots, time.Now())
+			if err != nil {
+				t.Fatal(err)
+			}
+			if v.DeviceAuth != tc.want {
+				t.Errorf("DeviceAuth = %v, want %v", v.DeviceAuth, tc.want)
+			}
+			if v.Claims[walletflowtest.NameSpace]["family_name"] != walletflowtest.FamilyName {
+				t.Errorf("disclosed %v", v.Claims)
+			}
+			if wantAgreed := tc.want == mdoc.DeviceAuthMAC; (keys.agreed > 0) != wantAgreed {
+				t.Errorf("agreed %d times", keys.agreed)
+			}
+		})
+	}
 }

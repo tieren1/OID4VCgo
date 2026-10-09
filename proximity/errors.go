@@ -51,6 +51,12 @@ var (
 	// isn't encrypted (§9.1.1.4), so anyone within radio range can send
 	// one: don't treat it as the holder's authenticated decision.
 	ErrDeclined = errors.New("proximity: mdoc terminated the session without a response")
+
+	// ErrNoKeyAgreement is a KeyAgreer's error, wrapped, when its key
+	// can't agree keys — a hardware key created for signing only — so
+	// the caller can answer with a signature instead
+	// (BuildDeviceResponse). BuildDeviceResponseMAC's error wraps it.
+	ErrNoKeyAgreement = errors.New("proximity: the device key can't agree keys")
 )
 
 // StatusFor maps an error from this package to the status code the

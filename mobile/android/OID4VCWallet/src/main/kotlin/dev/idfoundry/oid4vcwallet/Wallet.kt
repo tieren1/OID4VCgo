@@ -121,7 +121,27 @@ public data class WalletConfiguration(
     @SerialName("tls_pins") val tlsPins: Map<String, List<String>> = emptyMap(),
     /** The profile issuance follows. */
     @SerialName("issuance_profile") val issuanceProfile: IssuanceProfile = IssuanceProfile.OPENID4VCI,
+    /**
+     * How an in-person response authenticates the mdoc. [ProximityDeviceAuth.MAC_PREFERRED]
+     * needs a key store that is also a [KeyAgreement].
+     */
+    @SerialName("proximity_device_auth") val proximityDeviceAuth: ProximityDeviceAuth = ProximityDeviceAuth.SIGNATURE,
 ) {
+    /** How an in-person response authenticates the mdoc (ISO/IEC 18013-5 §9.1.3). */
+    @Serializable
+    public enum class ProximityDeviceAuth {
+        /** The holder key signs the session transcript (deviceSignature). The default. */
+        @SerialName("signature") SIGNATURE,
+
+        /**
+         * The holder key agrees a key with the reader's ephemeral key and
+         * the response carries a MAC (deviceMac), which the reader can
+         * check but can't show anyone else; a holder key that can't agree
+         * keys signs instead.
+         */
+        @SerialName("mac_preferred") MAC_PREFERRED,
+    }
+
     /** The profile issuance follows. */
     @Serializable
     public enum class IssuanceProfile {
@@ -414,7 +434,9 @@ public class Wallet(
         val wp = provider?.let(::WalletProviderAdapter)
         val config = json.encodeToString(WalletConfiguration.serializer(), configuration)
         handle = OID4VC.wrap { Mobile.newWallet(config, keys, credentials, wp) }
-        adapters = listOfNotNull(keys, credentials, wp)
+        val agreement = (keyStore as? KeyAgreement)?.let(::KeyAgreementAdapter)
+        agreement?.let(handle::setKeyAgreement)
+        adapters = listOfNotNull(keys, credentials, wp, agreement)
     }
 
     /**

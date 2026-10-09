@@ -1,5 +1,6 @@
 package dev.idfoundry.oid4vcwallet
 
+import android.os.Build
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.channels.Channel
@@ -80,7 +81,12 @@ class ProximityTest {
     private class Setup(val wallet: Wallet, val reader: ProximityReader, val mdocID: String)
 
     /** A wallet holding the test mdoc and recognizing the test reader, and that reader. */
-    private suspend fun setup(signed: Boolean = true, requireTrusted: Boolean = false): Setup {
+    private suspend fun setup(
+        signed: Boolean = true,
+        requireTrusted: Boolean = false,
+        holderKeys: AndroidKeystoreKeyStore = keys,
+        deviceAuth: WalletConfiguration.ProximityDeviceAuth = WalletConfiguration.ProximityDeviceAuth.SIGNATURE,
+    ): Setup {
         val env = TestEnv().also { envs += it }
         val readerSetup = json.parseToJsonElement(env.env.proximityReader(KeyStoreAdapter(keys))).jsonObject
         val readerConfig = json.decodeFromString(ProximityReaderConfiguration.serializer(), readerSetup["reader_config"]!!.jsonPrimitive.content)
@@ -89,8 +95,9 @@ class ProximityTest {
                 mdocReaderRoots = readerSetup["mdoc_reader_roots"]!!.jsonPrimitive.content,
                 mdocReaderRequireEKU = true,
                 requireTrustedMdocReader = requireTrusted,
+                proximityDeviceAuth = deviceAuth,
             ),
-            keys, InMemoryCredentialStore(), ProviderOf(env),
+            holderKeys, InMemoryCredentialStore(), ProviderOf(env),
         )
         val s = wallet.startIssuance(env.env.authorizationCodeOffer())
         s.completeAuthorization(env.approve(s.beginAuthorization()))
@@ -150,6 +157,42 @@ class ProximityTest {
         assertEquals("signature", verified.deviceAuth)
         assertTrue(verified.statusList != null)
         assertEquals(ProximityPresentation.State.Presented(false), awaitFinal(holder.state) { it.isFinal })
+    }
+
+    /**
+     * With MAC preferred and holder keys that agree keys, the reader
+     * verifies a deviceMac: from API 31, where Android Keystore agrees
+     * keys; below it, the same wallet signs.
+     */
+    @Test
+    fun deviceMacWhereKeystoreAgreesKeys(): Unit = runBlocking {
+        val agreeing = AndroidKeystoreKeyStore(
+            AndroidKeystoreKeyStore.Options(holderUserAuthentication = false, aliasPrefix = prefix, holderKeyAgreement = true),
+        )
+        val s = setup(holderKeys = agreeing, deviceAuth = WalletConfiguration.ProximityDeviceAuth.MAC_PREFERRED)
+        val (holder, reader) = start(s)
+        awaitRequest(holder)
+        holder.respond(0, s.mdocID, listOf(MdocPresentation.Element(NAMESPACE, "family_name")))
+        val result = awaitFinal(reader.state) { it.isFinal }
+        val verified = (result as? ProximityReaderSession.State.Verified)?.result ?: throw AssertionError("reader: $result")
+        val expected = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) "mac" else "signature"
+        assertEquals(expected, verified.deviceAuth)
+        assertEquals("Doe", verified.claims[NAMESPACE]!!.jsonObject["family_name"]!!.jsonPrimitive.content)
+    }
+
+    /** A wallet left at signatures signs, even with holder keys that agree keys. */
+    @Test
+    fun signatureByDefaultWithAgreeingKeys(): Unit = runBlocking {
+        val agreeing = AndroidKeystoreKeyStore(
+            AndroidKeystoreKeyStore.Options(holderUserAuthentication = false, aliasPrefix = prefix, holderKeyAgreement = true),
+        )
+        val s = setup(holderKeys = agreeing)
+        val (holder, reader) = start(s)
+        awaitRequest(holder)
+        holder.respond(0, s.mdocID, listOf(MdocPresentation.Element(NAMESPACE, "family_name")))
+        val verified = (awaitFinal(reader.state) { it.isFinal } as? ProximityReaderSession.State.Verified)?.result
+            ?: throw AssertionError("reader: ${reader.state.value}")
+        assertEquals("signature", verified.deviceAuth)
     }
 
     @Test

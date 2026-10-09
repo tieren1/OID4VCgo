@@ -77,6 +77,22 @@ type config struct {
 	// "per_presentation" (the default) or "per_verifier"
 	// (walletflow.Config.CopyPolicy).
 	CopyPolicy string `json:"copy_policy,omitempty"`
+	// ProximityDeviceAuth is how an in-person response authenticates the
+	// mdoc: "signature" (the default) or "mac_preferred", deviceMac
+	// where the KeyAgreement (SetKeyAgreement) can agree with the holder
+	// key (walletflow.Config.ProximityDeviceAuth).
+	ProximityDeviceAuth string `json:"proximity_device_auth,omitempty"`
+}
+
+// proximityDeviceAuth is the walletflow.ProximityDeviceAuth name names.
+func proximityDeviceAuth(name string) (walletflow.ProximityDeviceAuth, error) {
+	switch name {
+	case "", "signature":
+		return walletflow.ProximityDeviceSignature, nil
+	case "mac_preferred":
+		return walletflow.ProximityDeviceMACPreferred, nil
+	}
+	return 0, fmt.Errorf("proximity_device_auth %q: want signature or mac_preferred", name)
 }
 
 // copyPolicy is the walletflow.CopyPolicy name names.
@@ -100,6 +116,20 @@ var testHTTP atomic.Pointer[http.Client]
 type Wallet struct {
 	w    *walletflow.Wallet
 	keys KeyStore
+	ka   *agreement
+}
+
+// SetKeyAgreement gives the wallet ka, to agree keys with its holder
+// keys for deviceMac when "proximity_device_auth" is "mac_preferred";
+// nil removes it, and the wallet signs. It's separate from the KeyStore
+// so a KeyStore stays as it was, and a platform that can't agree keys
+// needn't implement it.
+func (w *Wallet) SetKeyAgreement(ka KeyAgreement) {
+	if ka == nil {
+		w.ka.ka.Store(nil)
+		return
+	}
+	w.ka.ka.Store(&ka)
 }
 
 // NewWallet returns a Wallet configured by configJSON:
@@ -140,6 +170,9 @@ func NewWallet(configJSON string, keys KeyStore, credentials CredentialStore, pr
 		return nil, newError(CodeInvalidInput, err)
 	}
 	wcfg.CopyPolicy = policy
+	if wcfg.ProximityDeviceAuth, err = proximityDeviceAuth(cfg.ProximityDeviceAuth); err != nil {
+		return nil, newError(CodeInvalidInput, err)
+	}
 	if cfg.IssuerRoots != "" {
 		if wcfg.IssuerRoots, err = certPool(cfg.IssuerRoots); err != nil {
 			return nil, newError(CodeInvalidInput, fmt.Errorf("issuer_roots: %w", err))
@@ -167,8 +200,9 @@ func NewWallet(configJSON string, keys KeyStore, credentials CredentialStore, pr
 	}
 	wcfg.RequireTrustedMdocReader = cfg.RequireTrustedMdocReader
 	wcfg.RequireSignedDCAPIRequests = cfg.RequireSignedDCAPIRequests
+	ka := &agreement{}
 	deps := walletflow.Dependencies{
-		Keys: keyStore{keys}, Credentials: credentialStore{credentials},
+		Keys: keyStore{ks: keys, ka: ka}, Credentials: credentialStore{credentials},
 		// crypto/rand.Reader itself, which production assurance requires.
 		Random: rand.Reader,
 		// Pending deferred credentials, authorizations in progress and
@@ -205,7 +239,7 @@ func NewWallet(configJSON string, keys KeyStore, credentials CredentialStore, pr
 	if err != nil {
 		return nil, newError(CodeInvalidInput, err)
 	}
-	return &Wallet{w: w, keys: keys}, nil
+	return &Wallet{w: w, keys: keys, ka: ka}, nil
 }
 
 // developmentClient is an HTTP client trusting the system's CAs and

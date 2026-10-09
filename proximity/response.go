@@ -73,6 +73,62 @@ func buildDeviceResponse(issuerSigned mdoc.IssuerSigned, docType string, holder 
 	return b, nil
 }
 
+// KeyAgreer is a device key that can agree a key with a peer — ECKA-DH
+// inside the key store — for MAC device authentication (§9.1.3.5). It
+// returns the shared secret Z, the SEC1 x-coordinate: for P-256, 32
+// octets.
+type KeyAgreer interface {
+	Agree(peer *ecdsa.PublicKey) ([]byte, error)
+}
+
+// BuildDeviceResponseMAC is BuildDeviceResponse with MAC device
+// authentication (§9.1.3.5, §12.4.5) instead of a signature: holder,
+// the mdoc's device key, agrees a key with eReaderKey
+// (DeviceSession.EReaderKey), and the DeviceResponse carries deviceMac
+// under the EMacKey derived from it. Unlike a signature, the reader can
+// check a MAC but can't show anyone else the holder made it.
+func BuildDeviceResponseMAC(req DocRequest, issuerSigned mdoc.IssuerSigned, holder KeyAgreer, eReaderKey *ecdsa.PublicKey, sessionTranscriptBytes []byte, elements [][2]string) ([]byte, error) {
+	if err := checkRequested(req, elements); err != nil {
+		return nil, err
+	}
+	if held, err := msoDocType(issuerSigned); err != nil {
+		return nil, fmt.Errorf("proximity: build DeviceResponse: %w", err)
+	} else if held != req.DocType {
+		return nil, fmt.Errorf("proximity: build DeviceResponse: the mdoc is a %q, the request is for %q", held, req.DocType)
+	}
+	if holder == nil {
+		return nil, fmt.Errorf("proximity: build DeviceResponse: no device key")
+	}
+	if eReaderKey == nil {
+		return nil, fmt.Errorf("proximity: build DeviceResponse: no reader key (session not established)")
+	}
+	if eReaderKey.Curve != elliptic.P256() {
+		return nil, fmt.Errorf("proximity: build DeviceResponse: DeviceMac needs a P-256 reader key, got %s", eReaderKey.Curve.Params().Name)
+	}
+	if len(sessionTranscriptBytes) == 0 {
+		return nil, fmt.Errorf("proximity: build DeviceResponse: no session transcript (session not established)")
+	}
+	selected := issuerSigned.SelectNameSpaces(elements)
+	if len(selected.NameSpaces) == 0 {
+		return nil, fmt.Errorf("proximity: build DeviceResponse: the credential holds none of the elements to disclose")
+	}
+	z, err := holder.Agree(eReaderKey)
+	if err != nil {
+		return nil, fmt.Errorf("proximity: build DeviceResponse: key agreement: %w", err)
+	}
+	deviceSigned, err := mdoc.ComputeDeviceMACFromSharedSecret(z, sessionTranscriptBytes, req.DocType, map[string]map[string]interface{}{})
+	if err != nil {
+		return nil, fmt.Errorf("proximity: build DeviceResponse: %w", err)
+	}
+	b, err := oid4vpmdoc.MarshalDeviceResponse(oid4vpmdoc.Document{
+		DocType: req.DocType, IssuerSigned: selected, DeviceSigned: deviceSigned,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("proximity: build DeviceResponse: %w", err)
+	}
+	return b, nil
+}
+
 // msoDocType is the docType in issuerSigned's MSO — the holder's own
 // mdoc, read without verifying it.
 func msoDocType(issuerSigned mdoc.IssuerSigned) (string, error) {

@@ -270,7 +270,39 @@ func ComputeDeviceMAC(
 	if err != nil {
 		return DeviceSigned{}, err
 	}
+	return deviceMACWithKey(key, nameSpacesBytes, authBytes, nameSpaces)
+}
 
+// ComputeDeviceMACFromSharedSecret is ComputeDeviceMAC for a device key
+// whose private half can't be handed over — one in the Secure Enclave
+// or Android Keystore: sharedSecret is the ECKA-DH shared secret Z
+// between the device key and readerPub (EReaderKey.Pub), the SEC1
+// x-coordinate (32 octets for P-256), as the key's own key agreement
+// (Keystore ECDH, SecKeyCopyKeyExchangeResult) returns it. The result
+// is byte for byte ComputeDeviceMAC's for the same inputs.
+func ComputeDeviceMACFromSharedSecret(
+	sharedSecret []byte,
+	sessionTranscriptBytes []byte, docType string,
+	nameSpaces map[string]map[string]interface{},
+) (DeviceSigned, error) {
+	if len(sharedSecret) != 32 {
+		return DeviceSigned{}, fmt.Errorf("mdoc: DeviceMac shared secret is %d bytes, want 32 (P-256)", len(sharedSecret))
+	}
+	nameSpacesBytes, authBytes, err := deviceSignedInput(sessionTranscriptBytes, docType, nameSpaces)
+	if err != nil {
+		return DeviceSigned{}, err
+	}
+	key, err := eMacKeyFromSharedSecret(sharedSecret, sessionTranscriptBytes)
+	if err != nil {
+		return DeviceSigned{}, err
+	}
+	return deviceMACWithKey(key, nameSpacesBytes, authBytes, nameSpaces)
+}
+
+// deviceMACWithKey is ComputeDeviceMAC and
+// ComputeDeviceMACFromSharedSecret's shared end: the detached
+// COSE_Mac0 under EMacKey key.
+func deviceMACWithKey(key, nameSpacesBytes, authBytes []byte, nameSpaces map[string]map[string]interface{}) (DeviceSigned, error) {
 	// §12.4.5: "The external_aad field...shall be a bytestring of size zero."
 	mac0, err := cose.ComputeMAC(key, cose.Headers{}, cose.Headers{}, authBytes, []byte{})
 	if err != nil {
@@ -335,7 +367,12 @@ func deriveEMacKey(priv *ecdsa.PrivateKey, peerPub *ecdsa.PublicKey, sessionTran
 	if err != nil {
 		return nil, fmt.Errorf("mdoc: ECDH key agreement: %w", err)
 	}
+	return eMacKeyFromSharedSecret(z, sessionTranscriptBytes)
+}
 
+// eMacKeyFromSharedSecret is deriveEMacKey's HKDF half, from the ECKA-DH
+// shared secret z.
+func eMacKeyFromSharedSecret(z, sessionTranscriptBytes []byte) ([]byte, error) {
 	salt := sha256.Sum256(sessionTranscriptBytes)
 	key, err := hkdf.Key(salt[:], z, []byte("EMacKey"), 32)
 	if err != nil {

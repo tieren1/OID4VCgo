@@ -3,9 +3,12 @@ package mobile
 import (
 	"context"
 	"crypto"
+	"crypto/ecdh"
 	"crypto/ecdsa"
 	"crypto/elliptic"
+	"crypto/rand"
 	"crypto/sha256"
+	"crypto/subtle"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -14,12 +17,14 @@ import (
 	"math/big"
 	"net/http"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	fapi "github.com/idfoundry/fapigo"
 	"github.com/idfoundry/fapigo/fapihttp"
 	"github.com/idfoundry/fapigo/keys"
 
+	"github.com/idfoundry/oid4vcgo/proximity"
 	"github.com/idfoundry/oid4vcgo/wallet"
 	"github.com/idfoundry/oid4vcgo/walletflow"
 )
@@ -61,8 +66,43 @@ type KeyStore interface {
 	Durable() bool
 }
 
+// KeyAgreement agrees keys with the wallet's holder keys — ECDH inside
+// the platform key store — so an in-person response can authenticate
+// with deviceMac (ISO/IEC 18013-5 §9.1.3.5) rather than a signature. An
+// app gives one with Wallet.SetKeyAgreement; without one, the wallet
+// signs.
+type KeyAgreement interface {
+	// Agree runs ECDH between key id and peerPublicKey, an uncompressed
+	// X9.63 P-256 point, and returns the shared secret: its 32-byte
+	// x-coordinate. For a key that can't agree keys (created for
+	// signing only), it fails with a message starting with
+	// "[no_key_agreement]": the wallet then signs instead.
+	Agree(id string, peerPublicKey []byte) ([]byte, error)
+}
+
+// noKeyAgreementPrefix starts the message of a KeyAgreement's error for
+// a key that can't agree keys.
+const noKeyAgreementPrefix = "[no_key_agreement]"
+
+// agreement holds a Wallet's KeyAgreement, which SetKeyAgreement may set
+// after its keys are made.
+type agreement struct{ ka atomic.Pointer[KeyAgreement] }
+
+func (a *agreement) get() KeyAgreement {
+	if a == nil {
+		return nil
+	}
+	if p := a.ka.Load(); p != nil {
+		return *p
+	}
+	return nil
+}
+
 // keyStore is a KeyStore as a walletflow.KeyStore.
-type keyStore struct{ ks KeyStore }
+type keyStore struct {
+	ks KeyStore
+	ka *agreement
+}
 
 // KeyCustody declares the KeyStore's custody to fapigo/client: its keys
 // are durable when it says so.
@@ -112,7 +152,7 @@ func (k keyStore) load(id string) (*platformKey, error) {
 	if err != nil {
 		return nil, newError(CodePlatform, fmt.Errorf("key %q's public key: %w", id, err))
 	}
-	return &platformKey{ks: k.ks, id: id, pub: pub}, nil
+	return &platformKey{ks: k.ks, ka: k.ka, id: id, pub: pub}, nil
 }
 
 // notFoundError is a missing key: a CodeNotFound Error that is also
@@ -137,8 +177,35 @@ func (e *notFoundError) As(target any) bool {
 // crypto.Signer whose private half stays in the KeyStore.
 type platformKey struct {
 	ks  KeyStore
+	ka  *agreement
 	id  string
 	pub *ecdsa.PublicKey
+}
+
+var _ proximity.KeyAgreer = (*platformKey)(nil)
+
+// Agree implements proximity.KeyAgreer through the Wallet's
+// KeyAgreement: without one, or for a key that can't agree keys, an
+// error wrapping proximity.ErrNoKeyAgreement, so the response is signed.
+func (p *platformKey) Agree(peer *ecdsa.PublicKey) ([]byte, error) {
+	ka := p.ka.get()
+	if ka == nil {
+		return nil, proximity.ErrNoKeyAgreement
+	}
+	raw, err := peer.Bytes()
+	if err != nil {
+		return nil, newError(CodeInvalidInput, fmt.Errorf("peer key: %w", err))
+	}
+	z, err := ka.Agree(p.id, raw)
+	switch {
+	case err != nil && strings.HasPrefix(err.Error(), noKeyAgreementPrefix):
+		return nil, fmt.Errorf("key %q: %w", p.id, proximity.ErrNoKeyAgreement)
+	case err != nil:
+		return nil, newError(CodePlatform, fmt.Errorf("agree with key %q: %w", p.id, err))
+	case len(z) != 32:
+		return nil, newError(CodePlatform, fmt.Errorf("key %q agreed a %d-byte secret, want 32", p.id, len(z)))
+	}
+	return z, nil
 }
 
 func (p *platformKey) ID() string { return p.id }
@@ -174,7 +241,7 @@ func CheckKeyStore(store KeyStore) (string, error) {
 		return "", newError(CodeInvalidInput, errors.New("no key store"))
 	}
 	ctx := context.Background()
-	ks := keyStore{store}
+	ks := keyStore{ks: store}
 	w, err := newCoreWallet()
 	if err != nil {
 		return "", err
@@ -244,6 +311,64 @@ func checkPurpose(ctx context.Context, ks keyStore, w *wallet.Wallet, purpose wa
 		return newError(CodePlatform, fmt.Errorf("%s key: still there after DeleteKey (%v)", purpose, err))
 	}
 	return nil
+}
+
+// CheckKeyAgreement exercises ka with store's holder keys as deviceMac
+// will: it creates a holder key, agrees a key with a fresh P-256 key,
+// checks the secret is the one the other side computes, and deletes the
+// key. It returns {"abi", "key_agreement"}: "supported", or
+// "unsupported" when ka reports the holder key can't agree keys (the
+// wallet then signs), or the first failure.
+func CheckKeyAgreement(store KeyStore, ka KeyAgreement) (string, error) {
+	if store == nil || ka == nil {
+		return "", newError(CodeInvalidInput, errors.New("a key store and a key agreement are required"))
+	}
+	ctx := context.Background()
+	ks := keyStore{ks: store, ka: &agreement{}}
+	ks.ka.ka.Store(&ka)
+	key, err := ks.NewKey(ctx, walletflow.KeyPurposeHolder)
+	if err != nil {
+		return "", err
+	}
+	defer func() { _ = ks.DeleteKey(ctx, key.ID()) }()
+	status, err := checkAgreement(key)
+	if err != nil {
+		return "", err
+	}
+	return marshal(struct {
+		result
+		KeyAgreement string `json:"key_agreement"`
+	}{result{ABIVersion}, status})
+}
+
+func checkAgreement(key walletflow.Key) (string, error) {
+	peer, err := ecdh.P256().GenerateKey(rand.Reader)
+	if err != nil {
+		return "", newError(CodeInternal, err)
+	}
+	peerPub, err := ecdsa.ParseUncompressedPublicKey(elliptic.P256(), peer.PublicKey().Bytes())
+	if err != nil {
+		return "", newError(CodeInternal, err)
+	}
+	z, err := key.(proximity.KeyAgreer).Agree(peerPub)
+	if errors.Is(err, proximity.ErrNoKeyAgreement) {
+		return "unsupported", nil
+	}
+	if err != nil {
+		return "", asError(CodePlatform, err)
+	}
+	holderPub, err := key.Public().(*ecdsa.PublicKey).ECDH()
+	if err != nil {
+		return "", newError(CodeInternal, err)
+	}
+	want, err := peer.ECDH(holderPub)
+	if err != nil {
+		return "", newError(CodeInternal, err)
+	}
+	if subtle.ConstantTimeCompare(z, want) != 1 {
+		return "", newError(CodePlatform, errors.New("holder key: the agreed secret isn't the peer's"))
+	}
+	return "supported", nil
 }
 
 // newCoreWallet returns the wallet package's Wallet, for the protocol

@@ -23,6 +23,7 @@ type DeviceSession struct {
 	bleIdent                          []byte
 
 	sessionTranscriptBytes []byte
+	eReaderKey             *ecdsa.PublicKey
 	cipher                 *cipherState
 	closed                 bool
 }
@@ -221,9 +222,15 @@ func (s *DeviceSession) HandleSessionEstablishment(msg []byte) (deviceRequest []
 	if len(deviceRequest) > MaxMessageBytes {
 		return nil, fmt.Errorf("proximity: DeviceRequest is %d bytes, over %d: %w", len(deviceRequest), MaxMessageBytes, ErrCBORDecoding)
 	}
-	s.sessionTranscriptBytes, s.cipher = transcript, cs
+	s.sessionTranscriptBytes, s.eReaderKey, s.cipher = transcript, eReaderKey, cs
 	return deviceRequest, nil
 }
+
+// EReaderKey is the reader's ephemeral public key from its
+// SessionEstablishment, which MAC device authentication
+// (BuildDeviceResponseMAC) agrees a key with; nil until
+// HandleSessionEstablishment succeeds.
+func (s *DeviceSession) EReaderKey() *ecdsa.PublicKey { return s.eReaderKey }
 
 // HandleSessionData processes a later message from the reader
 // (§9.1.1.4): data is the decrypted payload, if any, and status the

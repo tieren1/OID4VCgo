@@ -202,6 +202,108 @@ func TestBothBLEModes(t *testing.T) {
 	}
 }
 
+// agreeOnlyKey is a device key as a platform key store holds it for MAC
+// device authentication: it agrees a key, and never hands over its
+// private half.
+type agreeOnlyKey struct{ priv *ecdsa.PrivateKey }
+
+func (k agreeOnlyKey) Agree(peer *ecdsa.PublicKey) ([]byte, error) {
+	priv, err := k.priv.ECDH()
+	if err != nil {
+		return nil, err
+	}
+	pub, err := peer.ECDH()
+	if err != nil {
+		return nil, err
+	}
+	return priv.ECDH(pub)
+}
+
+func TestRoundTripDeviceMAC(t *testing.T) {
+	fx := issueFixture(t, mDL)
+	f := establish(t, mDL, map[string][]string{mDLNS: {"age_over_18"}})
+	if f.holder.EReaderKey() == nil {
+		t.Fatal("EReaderKey is nil after HandleSessionEstablishment")
+	}
+	resp, err := BuildDeviceResponseMAC(f.req, fx.issuerSigned, agreeOnlyKey{fx.deviceKey}, f.holder.EReaderKey(), f.holder.SessionTranscriptBytes(), f.req.Elements)
+	if err != nil {
+		t.Fatalf("BuildDeviceResponseMAC: %v", err)
+	}
+	msg, err := f.holder.Encrypt(resp, false)
+	if err != nil {
+		t.Fatalf("Encrypt: %v", err)
+	}
+	v, err := f.reader.Verify(msg, fx.roots, time.Now())
+	if err != nil {
+		t.Fatalf("Verify: %v", err)
+	}
+	if v.DeviceAuth != mdoc.DeviceAuthMAC {
+		t.Errorf("DeviceAuth = %v, want MAC", v.DeviceAuth)
+	}
+	if got := v.Claims[mDLNS]; len(got) != 1 || got["age_over_18"] != true {
+		t.Errorf("Claims = %v, want only age_over_18 = true", v.Claims)
+	}
+}
+
+// TestDeviceMACWrongKeyRejected: a MAC agreed with a key other than
+// the MSO's device key doesn't verify at the reader.
+func TestDeviceMACWrongKeyRejected(t *testing.T) {
+	fx := issueFixture(t, mDL)
+	f := establish(t, mDL, map[string][]string{mDLNS: {"age_over_18"}})
+	other, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatalf("generate key: %v", err)
+	}
+	resp, err := BuildDeviceResponseMAC(f.req, fx.issuerSigned, agreeOnlyKey{other}, f.holder.EReaderKey(), f.holder.SessionTranscriptBytes(), f.req.Elements)
+	if err != nil {
+		t.Fatalf("BuildDeviceResponseMAC: %v", err)
+	}
+	msg, err := f.holder.Encrypt(resp, false)
+	if err != nil {
+		t.Fatalf("Encrypt: %v", err)
+	}
+	if _, err := f.reader.Verify(msg, fx.roots, time.Now()); err == nil {
+		t.Error("Verify accepted a MAC agreed with the wrong device key")
+	}
+}
+
+func TestBuildDeviceResponseMACRejects(t *testing.T) {
+	fx := issueFixture(t, mDL)
+	f := establish(t, mDL, map[string][]string{mDLNS: {"age_over_18"}})
+	key := agreeOnlyKey{fx.deviceKey}
+	st := f.holder.SessionTranscriptBytes()
+	p384, err := ecdsa.GenerateKey(elliptic.P384(), rand.Reader)
+	if err != nil {
+		t.Fatalf("generate key: %v", err)
+	}
+	for name, call := range map[string]func() error{
+		"no key": func() error {
+			_, err := BuildDeviceResponseMAC(f.req, fx.issuerSigned, nil, f.holder.EReaderKey(), st, f.req.Elements)
+			return err
+		},
+		"no reader key": func() error {
+			_, err := BuildDeviceResponseMAC(f.req, fx.issuerSigned, key, nil, st, f.req.Elements)
+			return err
+		},
+		"P-384 reader": func() error {
+			_, err := BuildDeviceResponseMAC(f.req, fx.issuerSigned, key, &p384.PublicKey, st, f.req.Elements)
+			return err
+		},
+		"no transcript": func() error {
+			_, err := BuildDeviceResponseMAC(f.req, fx.issuerSigned, key, f.holder.EReaderKey(), nil, f.req.Elements)
+			return err
+		},
+		"no elements": func() error {
+			_, err := BuildDeviceResponseMAC(f.req, fx.issuerSigned, key, f.holder.EReaderKey(), st, nil)
+			return err
+		},
+	} {
+		if call() == nil {
+			t.Errorf("%s: accepted", name)
+		}
+	}
+}
+
 // TestRoundTripMultipleElements also covers central client mode, and a
 // holder that discloses only a consented subset of the request.
 func TestRoundTripMultipleElements(t *testing.T) {

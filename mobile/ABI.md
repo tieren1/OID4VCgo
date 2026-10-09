@@ -15,8 +15,10 @@ DC API's `StartMdocPresentation` and `MdocCandidates` arrived in
 OID4VCWallet 0.7.0 (Swift); `StartDCAPIPresentation`, proximity
 (`StartProximityPresentation`, `NewProximityReader`) and
 `require_signed_dcapi_requests` came after it, then `tls_pins` and the
-`tls_pin` code. An older wrapper shows a code it doesn't know as it is.
-Check a library's release notes for the calls it has.
+`tls_pin` code, and the KeyAgreement (`SetKeyAgreement`,
+`CheckKeyAgreement`, `proximity_device_auth`). An older wrapper shows a
+code it doesn't know as it is. Check a library's release notes for the
+calls it has.
 
 The version changes whenever a function, object, JSON result, record
 format or error code below changes incompatibly.
@@ -95,6 +97,23 @@ Android Keystore (StrongBox, else the TEE) on Android.
 Instance and DPoP keys sign protocol messages silently; holder keys sign
 only when presenting, and may require user presence. `CheckKeyStore`
 exercises an implementation as the wallet will.
+
+### KeyAgreement
+
+Optional: ECDH with holder keys inside the platform key store, so an
+in-person response can authenticate with deviceMac (ISO/IEC 18013-5
+§9.1.3.5) instead of a signature. Give one with
+`Wallet.SetKeyAgreement(ka)` and set `"proximity_device_auth":
+"mac_preferred"`; it's separate from the KeyStore, which is unchanged.
+
+| Method | |
+|---|---|
+| `Agree(id, peerPublicKey) → []byte` | ECDH between holder key `id` and `peerPublicKey` (uncompressed X9.63 P-256): the 32-byte shared secret |
+
+A key that can't agree keys (Android Keystore keys need
+`PURPOSE_AGREE_KEY`, API 31+) fails with a message starting with
+`[no_key_agreement]`: the wallet then signs. Any other error fails the
+response as `platform`. `CheckKeyAgreement(store, ka)` exercises one.
 
 ### CredentialStore
 
@@ -175,7 +194,8 @@ library's an `IOException`.
  "require_signed_dcapi_requests": false,
  "development": false, "development_roots": "<PEM>", "locales": ["en-AU", "en"], "batch_size": 0,
  "request_refresh": false, "copy_policy": "per_presentation", "issuance_profile": "openid4vci",
- "tls_pins": {"issuer.example": ["<base64 SHA-256 of an SPKI>"]}}
+ "tls_pins": {"issuer.example": ["<base64 SHA-256 of an SPKI>"]},
+ "proximity_device_auth": "signature"}
 ```
 
 `issuer_roots` is needed to receive credentials, and `verifier_roots` to
@@ -463,7 +483,10 @@ request per session. Every method is safe to call from any thread.
 `elementsJSON` and `document` are as in MdocPresentation. The
 credential's next unused copy is presented, recorded as shown to the
 reader by its certificate, or to a reader of that session alone when it
-didn't sign. The holder key signs during `Respond`. An mDL must release
+didn't sign. The holder key signs during `Respond` — or, with
+`"proximity_device_auth": "mac_preferred"` and a KeyAgreement that can
+agree with it, agrees a key with the reader's ephemeral key for
+deviceMac, which the reader can check but can't show anyone else. An mDL must release
 its mandatory elements to an unauthenticated reader (ISO/IEC 18013-5
 §7.2.1), so `require_trusted_mdoc_reader` suits other documents.
 
@@ -525,6 +548,7 @@ ProximityReader was added within ABI version 12.
 |---|---|
 | `ParseRequestLink(link)` | `{"client_id", "request_uri", "request_uri_method"}` |
 | `CheckKeyStore(store)` | `{"checked": [purposes]}` |
+| `CheckKeyAgreement(store, ka)` | `{"key_agreement"}`: `supported`, or `unsupported` for a holder key that can't agree keys |
 | `IsTestBuild()` | whether the framework is the `mobiletest` build: an app should refuse to run on one |
 
 ## Test build

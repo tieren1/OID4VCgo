@@ -336,7 +336,7 @@ func (p *ProximityPresentation) respond(ctx context.Context, request int, r rese
 	if err != nil {
 		return nil, fmt.Errorf("walletflow: credential %q's holder key: %w", r.id, err)
 	}
-	resp, err := proximity.BuildDeviceResponse(p.reqs[request], issuerSigned, k, p.s.SessionTranscriptBytes(), elements)
+	resp, err := p.deviceResponse(request, issuerSigned, k, elements)
 	if err != nil {
 		return nil, fmt.Errorf("walletflow: %w", err)
 	}
@@ -346,6 +346,37 @@ func (p *ProximityPresentation) respond(ctx context.Context, request int, r rese
 	}
 	return send, nil
 }
+
+// deviceResponse builds the DeviceResponse, authenticating the mdoc as
+// Config.ProximityDeviceAuth says: with ProximityDeviceMACPreferred and
+// a holder key that agrees keys (proximity.KeyAgreer), with a MAC;
+// otherwise, or if the key can't agree (proximity.ErrNoKeyAgreement),
+// with a signature.
+func (p *ProximityPresentation) deviceResponse(request int, issuerSigned mdoc.IssuerSigned, k Key, elements [][2]string) ([]byte, error) {
+	if ka, ok := k.(proximity.KeyAgreer); ok && p.w.cfg.ProximityDeviceAuth == ProximityDeviceMACPreferred {
+		resp, err := proximity.BuildDeviceResponseMAC(p.reqs[request], issuerSigned, ka, p.s.EReaderKey(), p.s.SessionTranscriptBytes(), elements)
+		if !errors.Is(err, proximity.ErrNoKeyAgreement) {
+			return resp, err
+		}
+	}
+	return proximity.BuildDeviceResponse(p.reqs[request], issuerSigned, k, p.s.SessionTranscriptBytes(), elements)
+}
+
+// ProximityDeviceAuth is how an in-person response authenticates the
+// mdoc (ISO/IEC 18013-5 §9.1.3).
+type ProximityDeviceAuth int
+
+const (
+	// ProximityDeviceSignature signs over the session transcript with
+	// the holder key (deviceSignature).
+	ProximityDeviceSignature ProximityDeviceAuth = iota
+	// ProximityDeviceMACPreferred MACs the session transcript under a
+	// key the holder key agrees with the reader's ephemeral key
+	// (deviceMac), when the holder key is a proximity.KeyAgreer that
+	// can; otherwise it signs. Unlike a signature, the reader can't
+	// show anyone else the holder made the response.
+	ProximityDeviceMACPreferred
+)
 
 // Terminate ends the session — the holder declined, cancelled or timed
 // out — and returns the message telling the reader so (status 20),

@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/idfoundry/oid4vcgo/credential/mdoc"
 	"github.com/idfoundry/oid4vcgo/proximity"
 	"github.com/idfoundry/oid4vcgo/walletflow/walletflowtest"
 )
@@ -273,5 +274,62 @@ func TestSessions_ProximityBothModes(t *testing.T) {
 		if _, err := h.w.StartProximityPresentationWithModes(bad); code(err) != CodeInvalidInput {
 			t.Errorf("modes %s: %v, want %s", bad, err, CodeInvalidInput)
 		}
+	}
+}
+
+// With "proximity_device_auth": "mac_preferred" and a KeyAgreement, the
+// reader verifies a deviceMac; a sign-only key, no KeyAgreement or the
+// default configuration signs.
+func TestSessions_ProximityDeviceAuth(t *testing.T) {
+	for name, tc := range map[string]struct {
+		auth     string
+		ka       bool
+		signOnly bool
+		want     mdoc.DeviceAuthType
+	}{
+		"mac":                {"mac_preferred", true, false, mdoc.DeviceAuthMAC},
+		"mac, sign-only key": {"mac_preferred", true, true, mdoc.DeviceAuthSignature},
+		"mac, no agreement":  {"mac_preferred", false, false, mdoc.DeviceAuthSignature},
+		"default":            {"", true, false, mdoc.DeviceAuthSignature},
+	} {
+		t.Run(name, func(t *testing.T) {
+			reader := newTestReader(t)
+			settings := map[string]any{"mdoc_reader_roots": reader.caPEM}
+			if tc.auth != "" {
+				settings["proximity_device_auth"] = tc.auth
+			}
+			h := newHarness(t, false).withConfig(t, settings)
+			if tc.ka {
+				h.w.SetKeyAgreement(&goKeyAgreement{s: h.keys, signOnly: tc.signOnly})
+			}
+			var mdocID string
+			for _, c := range h.receive(t) {
+				if c.Format == "mso_mdoc" {
+					mdocID = c.ID
+				}
+			}
+			p, r, msg := startProximity(t, h, &reader)
+			if ev := decode[proximityEvent](t, p.HandleMessage(NewOperation(0), msg)); ev.Event != "request" {
+				t.Fatalf("HandleMessage = %+v", ev)
+			}
+			out, err := p.Respond(NewOperation(0), 0, mdocID, `[["`+walletflowtest.NameSpace+`","family_name"]]`)
+			if err != nil {
+				t.Fatal(err)
+			}
+			roots := x509.NewCertPool()
+			if !roots.AppendCertsFromPEM([]byte(issuerRootsPEM(t, h))) {
+				t.Fatal("no issuer roots")
+			}
+			v, err := r.Verify(sent(t, decode[struct{ Send string }](t, out).Send), roots, time.Now())
+			if err != nil {
+				t.Fatal(err)
+			}
+			if v.DeviceAuth != tc.want {
+				t.Errorf("DeviceAuth = %v, want %v", v.DeviceAuth, tc.want)
+			}
+		})
+	}
+	if _, err := NewWallet(`{"proximity_device_auth": "mac_only"}`, newGoKeyStore(), newGoCredentialStore(), nil); code(err) != CodeInvalidInput {
+		t.Errorf("an unknown proximity_device_auth: %v", err)
 	}
 }

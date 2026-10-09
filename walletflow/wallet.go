@@ -82,6 +82,10 @@ type Config struct {
 	// a ProximityEvent whose Err wraps it, sending the reader a
 	// termination. It needs MdocReaderRoots.
 	RequireTrustedMdocReader bool
+	// ProximityDeviceAuth is how an in-person response authenticates the
+	// mdoc (ISO/IEC 18013-5 §9.1.3). The zero value,
+	// ProximityDeviceSignature, signs with the holder key.
+	ProximityDeviceAuth ProximityDeviceAuth
 
 	// RequireSignedDCAPIRequests refuses an unsigned OpenID4VP request
 	// over the Digital Credentials API (StartDCAPIPresentation) with an
