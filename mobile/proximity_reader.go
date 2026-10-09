@@ -75,7 +75,7 @@ func NewProximityReader(configJSON string, keys KeyStore) (*ProximityReader, err
 		if err != nil {
 			return nil, newError(CodeInvalidInput, fmt.Errorf("reader_chain: %w", err))
 		}
-		key, err := keyStore{keys}.load(cfg.ReaderKeyID)
+		key, err := keyStore{ks: keys}.load(cfg.ReaderKeyID)
 		if err != nil {
 			return nil, err
 		}

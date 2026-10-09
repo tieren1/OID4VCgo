@@ -3,6 +3,7 @@ package mobile
 import (
 	"context"
 	"crypto"
+	"crypto/ecdh"
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
@@ -13,6 +14,7 @@ import (
 	"sync"
 	"testing"
 
+	"github.com/idfoundry/oid4vcgo/proximity"
 	"github.com/idfoundry/oid4vcgo/walletflow"
 )
 
@@ -101,6 +103,124 @@ func (s *goKeyStore) DeleteKey(id string) error {
 	return nil
 }
 
+// goKeyAgreement is a KeyAgreement over a goKeyStore's keys, as the
+// app's would be, with ways to misbehave.
+type goKeyAgreement struct {
+	s        *goKeyStore
+	signOnly bool // reports the key can't agree keys
+	wrong    bool // agrees with another key
+	err      error
+	n        int
+}
+
+func (a *goKeyAgreement) Agree(id string, peerPublicKey []byte) ([]byte, error) {
+	a.n++
+	if a.signOnly {
+		return nil, errors.New("[no_key_agreement] created for signing only")
+	}
+	if a.err != nil {
+		return nil, a.err
+	}
+	a.s.mu.Lock()
+	k, ok := a.s.keys[id]
+	a.s.mu.Unlock()
+	if !ok {
+		return nil, errors.New("no such key")
+	}
+	if a.wrong {
+		other, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+		if err != nil {
+			return nil, err
+		}
+		k = other
+	}
+	priv, err := k.ECDH()
+	if err != nil {
+		return nil, err
+	}
+	peer, err := ecdh.P256().NewPublicKey(peerPublicKey)
+	if err != nil {
+		return nil, err
+	}
+	return priv.ECDH(peer)
+}
+
+func TestCheckKeyAgreement(t *testing.T) {
+	for name, tc := range map[string]struct {
+		ka   func(*goKeyStore) *goKeyAgreement
+		want string
+		code string
+	}{
+		"supported":   {func(s *goKeyStore) *goKeyAgreement { return &goKeyAgreement{s: s} }, "supported", ""},
+		"sign only":   {func(s *goKeyStore) *goKeyAgreement { return &goKeyAgreement{s: s, signOnly: true} }, "unsupported", ""},
+		"another key": {func(s *goKeyStore) *goKeyAgreement { return &goKeyAgreement{s: s, wrong: true} }, "", CodePlatform},
+		"fails":       {func(s *goKeyStore) *goKeyAgreement { return &goKeyAgreement{s: s, err: errors.New("keystore busy")} }, "", CodePlatform},
+	} {
+		s := newGoKeyStore()
+		out, err := CheckKeyAgreement(s, tc.ka(s))
+		if tc.code != "" {
+			if code(err) != tc.code {
+				t.Errorf("%s: CheckKeyAgreement = %v, want %s", name, err, tc.code)
+			}
+		} else if err != nil {
+			t.Errorf("%s: %v", name, err)
+		} else {
+			var report struct {
+				ABI          int    `json:"abi"`
+				KeyAgreement string `json:"key_agreement"`
+			}
+			if err := json.Unmarshal([]byte(out), &report); err != nil || report.ABI != ABIVersion || report.KeyAgreement != tc.want {
+				t.Errorf("%s: report = %s (%v)", name, out, err)
+			}
+		}
+		if len(s.keys) != 0 {
+			t.Errorf("%s: %d keys left behind", name, len(s.keys))
+		}
+		if strings.Join(s.purposes, ",") != "holder" {
+			t.Errorf("%s: purposes asked for = %v", name, s.purposes)
+		}
+	}
+	if _, err := CheckKeyAgreement(newGoKeyStore(), nil); code(err) != CodeInvalidInput {
+		t.Errorf("no key agreement: %v", err)
+	}
+}
+
+// A platform key agrees keys only through a KeyAgreement; without one,
+// or for a sign-only key, it reports proximity.ErrNoKeyAgreement.
+func TestPlatformKeyAgree(t *testing.T) {
+	s := newGoKeyStore()
+	ka := &agreement{}
+	ks := keyStore{ks: s, ka: ka}
+	key, err := ks.NewKey(context.Background(), walletflow.KeyPurposeHolder)
+	if err != nil {
+		t.Fatal(err)
+	}
+	peer, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	agreer := key.(proximity.KeyAgreer)
+	if _, err := agreer.Agree(&peer.PublicKey); !errors.Is(err, proximity.ErrNoKeyAgreement) {
+		t.Errorf("no KeyAgreement: %v", err)
+	}
+	var sign KeyAgreement = &goKeyAgreement{s: s, signOnly: true}
+	ka.ka.Store(&sign)
+	if _, err := agreer.Agree(&peer.PublicKey); !errors.Is(err, proximity.ErrNoKeyAgreement) {
+		t.Errorf("sign-only key: %v", err)
+	}
+	var good KeyAgreement = &goKeyAgreement{s: s}
+	ka.ka.Store(&good)
+	z, err := agreer.Agree(&peer.PublicKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	peerPriv, _ := peer.ECDH()
+	holderPub, _ := key.Public().(*ecdsa.PublicKey).ECDH()
+	if want, _ := peerPriv.ECDH(holderPub); string(z) != string(want) {
+		t.Error("the agreed secret isn't the peer's")
+	}
+}
+
 func TestCheckKeyStore(t *testing.T) {
 	s := newGoKeyStore()
 	out, err := CheckKeyStore(s)
@@ -151,7 +271,7 @@ func TestCheckKeyStore_FindsMisbehaviour(t *testing.T) {
 // and a missing one as walletflow.ErrNotFound.
 func TestKeyStoreIsAWalletflowKeyStore(t *testing.T) {
 	ctx := context.Background()
-	ks := keyStore{newGoKeyStore()}
+	ks := keyStore{ks: newGoKeyStore()}
 	if _, err := walletflow.New(walletflow.Config{}, walletflow.Dependencies{Keys: ks, Credentials: walletflow.NewMemoryCredentialStore()}); err != nil {
 		t.Fatal(err)
 	}
@@ -179,7 +299,7 @@ func TestKeyStoreIsAWalletflowKeyStore(t *testing.T) {
 func TestKeyStore_DeletesAKeyItCantLoad(t *testing.T) {
 	s := newGoKeyStore()
 	s.pubErr = errors.New("keychain unavailable")
-	if _, err := (keyStore{s}).NewKey(context.Background(), walletflow.KeyPurposeHolder); code(err) != CodePlatform {
+	if _, err := (keyStore{ks: s}).NewKey(context.Background(), walletflow.KeyPurposeHolder); code(err) != CodePlatform {
 		t.Fatalf("NewKey = %v", err)
 	}
 	if len(s.keys) != 0 {

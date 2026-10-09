@@ -33,7 +33,7 @@ func (e *TestEnv) ProximityReader(keys KeyStore) (string, error) {
 	if err != nil {
 		return "", newError(CodePlatform, err)
 	}
-	key, err := keyStore{keys}.load(id)
+	key, err := keyStore{ks: keys}.load(id)
 	if err != nil {
 		return "", err
 	}
