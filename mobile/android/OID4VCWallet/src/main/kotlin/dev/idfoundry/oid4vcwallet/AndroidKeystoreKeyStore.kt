@@ -16,13 +16,21 @@ import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.withContext
 import java.math.BigInteger
+import java.security.AlgorithmParameters
+import java.security.GeneralSecurityException
 import java.security.KeyFactory
 import java.security.KeyPairGenerator
 import java.security.PrivateKey
+import java.security.ProviderException
+import java.security.PublicKey
 import java.security.Signature
 import java.security.interfaces.ECPublicKey
 import java.security.spec.ECGenParameterSpec
+import java.security.spec.ECParameterSpec
+import java.security.spec.ECPoint
+import java.security.spec.ECPublicKeySpec
 import java.util.UUID
+import javax.crypto.KeyAgreement as JavaKeyAgreement
 import kotlin.coroutines.resume
 import kotlin.coroutines.resumeWithException
 import java.security.KeyStore as JavaKeyStore
@@ -94,7 +102,7 @@ public class AndroidKeystoreKeyStore(
     /** How the store makes keys. */
     public val options: Options = Options(),
     private val authenticator: HolderAuthenticator? = null,
-) : KeyStore {
+) : KeyStore, KeyAgreement {
     init {
         // Per-use authentication by biometrics or the screen lock is API
         // 30's: below it, fail now rather than make weaker keys.
@@ -133,6 +141,17 @@ public class AndroidKeystoreKeyStore(
         val holderUserAuthentication: Boolean = true,
         /** Prefixes every key's alias. Keys under another prefix are never touched, by a sweep or anything else. */
         val aliasPrefix: String = "org.idfoundry.oid4vcgo.key.",
+        /**
+         * Make holder keys able to agree keys too (`PURPOSE_AGREE_KEY`),
+         * for deviceMac in person
+         * ([WalletConfiguration.ProximityDeviceAuth.MAC_PREFERRED]). It
+         * needs API 31; below it, or where the hardware refuses a key for
+         * both, holder keys sign only, and the wallet signs. A holder key
+         * that also requires the holder ([holderUserAuthentication]) signs
+         * too: the holder is authenticated for a signature, not an
+         * agreement.
+         */
+        val holderKeyAgreement: Boolean = false,
     )
 
     private val keystore: JavaKeyStore = JavaKeyStore.getInstance(PROVIDER).apply { load(null) }
@@ -142,7 +161,43 @@ public class AndroidKeystoreKeyStore(
 
     override fun createKey(purpose: KeyPurpose): String {
         val id = UUID.randomUUID().toString()
-        val spec = KeyGenParameterSpec.Builder(alias(id), KeyProperties.PURPOSE_SIGN)
+        // API 31's: holder keys that also agree keys, for deviceMac. If the
+        // hardware refuses a key for both (some StrongBox or older
+        // KeyMint), it signs only, and the wallet signs.
+        if (purpose == KeyPurpose.HOLDER && options.holderKeyAgreement && Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            try {
+                generate(id, purpose, KeyProperties.PURPOSE_SIGN or KeyProperties.PURPOSE_AGREE_KEY)
+                return id
+            } catch (e: GeneralSecurityException) {
+                keystore.deleteEntry(alias(id))
+            } catch (e: ProviderException) {
+                keystore.deleteEntry(alias(id))
+            }
+        }
+        generate(id, purpose, KeyProperties.PURPOSE_SIGN)
+        return id
+    }
+
+    /**
+     * ECDH between holder key [id] and [peerPublicKey] inside Android
+     * Keystore. A key made without `PURPOSE_AGREE_KEY` (see
+     * [Options.holderKeyAgreement]), below API 31, or requiring the
+     * holder, throws [KeyAgreementUnsupportedException]: the wallet signs.
+     */
+    override fun agree(id: String, peerPublicKey: ByteArray): ByteArray {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.S) throw KeyAgreementUnsupportedException("key agreement in Android Keystore needs API 31")
+        val key = keystore.getKey(alias(id), null) as? PrivateKey ?: throw StoreException("no key $id")
+        val info = info(key)
+        if (info.purposes and KeyProperties.PURPOSE_AGREE_KEY == 0) throw KeyAgreementUnsupportedException("key $id signs only")
+        if (info.isUserAuthenticationRequired) throw KeyAgreementUnsupportedException("key $id requires the holder for each signature")
+        val agreement = JavaKeyAgreement.getInstance("ECDH", PROVIDER)
+        agreement.init(key)
+        agreement.doPhase(peerKey(peerPublicKey), true)
+        return agreement.generateSecret()
+    }
+
+    private fun generate(id: String, purpose: KeyPurpose, purposes: Int) {
+        val spec = KeyGenParameterSpec.Builder(alias(id), purposes)
             .setAlgorithmParameterSpec(ECGenParameterSpec("secp256r1"))
             // Go hands over a SHA-256 digest: NONEwithECDSA signs it as is.
             .setDigests(KeyProperties.DIGEST_NONE, KeyProperties.DIGEST_SHA256)
@@ -168,7 +223,7 @@ public class AndroidKeystoreKeyStore(
             if (options.strongBox == StrongBox.REQUIRED) throw StoreException("StrongBox needs API 28")
             generator.initialize(spec.build())
             generator.generateKeyPair()
-            return id
+            return
         }
         when (options.strongBox) {
             StrongBox.OFF -> generator.initialize(spec.build())
@@ -176,13 +231,26 @@ public class AndroidKeystoreKeyStore(
             StrongBox.PREFERRED -> try {
                 generator.initialize(spec.setIsStrongBoxBacked(true).build())
                 generator.generateKeyPair()
-                return id
+                return
             } catch (e: StrongBoxUnavailableException) {
+                generator.initialize(spec.setIsStrongBoxBacked(false).build())
+            } catch (e: ProviderException) {
+                // StrongBox without key agreement: the TEE has it.
+                if (purposes and KeyProperties.PURPOSE_AGREE_KEY == 0) throw e
+                keystore.deleteEntry(alias(id))
                 generator.initialize(spec.setIsStrongBoxBacked(false).build())
             }
         }
         generator.generateKeyPair()
-        return id
+    }
+
+    // An uncompressed X9.63 P-256 point as a Java public key.
+    private fun peerKey(point: ByteArray): PublicKey {
+        if (point.size != 65 || point[0] != 4.toByte()) throw StoreException("the peer key isn't an uncompressed P-256 point")
+        val params = AlgorithmParameters.getInstance("EC").apply { init(ECGenParameterSpec("secp256r1")) }
+            .getParameterSpec(ECParameterSpec::class.java)
+        val w = ECPoint(BigInteger(1, point.copyOfRange(1, 33)), BigInteger(1, point.copyOfRange(33, 65)))
+        return KeyFactory.getInstance("EC").generatePublic(ECPublicKeySpec(w, params))
     }
 
     override fun publicKey(id: String): ByteArray? {

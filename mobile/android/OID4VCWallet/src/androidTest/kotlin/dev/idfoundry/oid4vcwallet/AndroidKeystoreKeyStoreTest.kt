@@ -10,6 +10,7 @@ import androidx.test.filters.SdkSuppress
 import androidx.test.platform.app.InstrumentationRegistry
 import kotlinx.coroutines.runBlocking
 import org.junit.After
+import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
@@ -17,7 +18,14 @@ import org.junit.Assert.fail
 import org.junit.Assume.assumeTrue
 import org.junit.Test
 import org.junit.runner.RunWith
+import java.math.BigInteger
+import java.security.KeyFactory
+import java.security.KeyPairGenerator
 import java.security.MessageDigest
+import java.security.interfaces.ECPublicKey
+import java.security.spec.ECGenParameterSpec
+import java.security.spec.X509EncodedKeySpec
+import javax.crypto.KeyAgreement
 
 /**
  * Android Keystore keys through the wallet: Go signs with them and checks
@@ -125,6 +133,54 @@ class AndroidKeystoreKeyStoreTest {
         assertEquals(listOf(theirs), other.keyIDs())
         other.deleteKeys(emptySet())
     }
+
+    /** From API 31, a holder key made to agree keys agrees the secret the peer computes, and still signs. */
+    @Test
+    @SdkSuppress(minSdkVersion = Build.VERSION_CODES.S)
+    fun holderKeyAgreesKeys() {
+        val keys = AndroidKeystoreKeyStore(AndroidKeystoreKeyStore.Options(holderUserAuthentication = false, aliasPrefix = prefix, holderKeyAgreement = true))
+        val id = keys.createKey(KeyPurpose.HOLDER)
+        val peer = KeyPairGenerator.getInstance("EC").apply { initialize(ECGenParameterSpec("secp256r1")) }.generateKeyPair()
+        val peerPub = peer.public as ECPublicKey
+        val point = byteArrayOf(4) + fixed(peerPub.w.affineX) + fixed(peerPub.w.affineY)
+        val z = keys.agree(id, point)
+        val holderPub = KeyFactory.getInstance("EC").generatePublic(X509EncodedKeySpec(spki(keys.publicKey(id)!!)))
+        val want = KeyAgreement.getInstance("ECDH").apply {
+            init(peer.private)
+            doPhase(holderPub, true)
+        }.generateSecret()
+        assertArrayEquals(want, z)
+        assertTrue(keys.sign(id, MessageDigest.getInstance("SHA-256").digest(byteArrayOf(1))).isNotEmpty())
+        // Instance and DPoP keys never agree keys.
+        val dpop = keys.createKey(KeyPurpose.DPOP)
+        expectUnsupported { keys.agree(dpop, point) }
+    }
+
+    /** A holder key made without key agreement reports it, so the wallet signs. */
+    @Test
+    fun signOnlyHolderKeyDoesntAgree() {
+        val keys = store()
+        val id = keys.createKey(KeyPurpose.HOLDER)
+        expectUnsupported { keys.agree(id, ByteArray(65).also { it[0] = 4 }) }
+    }
+
+    private fun expectUnsupported(body: () -> Unit) {
+        try {
+            body()
+            fail("agreed with a key that can't")
+        } catch (e: KeyAgreementUnsupportedException) {
+            // As expected.
+        }
+    }
+
+    private fun fixed(n: BigInteger): ByteArray {
+        val b = n.toByteArray().dropWhile { it == 0.toByte() }.toByteArray()
+        return ByteArray(32 - b.size) + b
+    }
+
+    // An uncompressed P-256 point as a SubjectPublicKeyInfo.
+    private fun spki(point: ByteArray): ByteArray =
+        "3059301306072a8648ce3d020106082a8648ce3d030107034200".chunked(2).map { it.toInt(16).toByte() }.toByteArray() + point
 
     @Test
     fun malformedIDs() {

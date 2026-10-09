@@ -3,6 +3,7 @@ package dev.idfoundry.oid4vcwallet
 import kotlinx.coroutines.runBlocking
 import java.io.IOException
 import dev.idfoundry.oid4vcwallet.gomobile.mobile.CredentialStore as MobileCredentialStore
+import dev.idfoundry.oid4vcwallet.gomobile.mobile.KeyAgreement as MobileKeyAgreement
 import dev.idfoundry.oid4vcwallet.gomobile.mobile.KeyStore as MobileKeyStore
 import dev.idfoundry.oid4vcwallet.gomobile.mobile.WalletProvider as MobileWalletProvider
 
@@ -65,6 +66,25 @@ public interface KeyStore {
 }
 
 /**
+ * ECDH with the wallet's holder keys inside the key store, for deviceMac
+ * in person (ISO/IEC 18013-5 §9.1.3.5). A [KeyStore] that is also one is
+ * used for it when [WalletConfiguration.proximityDeviceAuth] is
+ * [WalletConfiguration.ProximityDeviceAuth.MAC_PREFERRED].
+ */
+public fun interface KeyAgreement {
+    /**
+     * Runs ECDH between key [id] and [peerPublicKey], an uncompressed
+     * X9.63 P-256 point, and returns the 32-byte shared secret. Throws
+     * [KeyAgreementUnsupportedException] for a key that can't agree keys
+     * (made for signing only): the wallet then signs instead.
+     */
+    public fun agree(id: String, peerPublicKey: ByteArray): ByteArray
+}
+
+/** A key that can't agree keys: the wallet signs instead of using a MAC. */
+public class KeyAgreementUnsupportedException(message: String) : Exception(message)
+
+/**
  * The wallet's credentials, as opaque records kept by ID under the
  * platform's data protection. An exception it throws reaches Go and
  * comes back as a [WalletException.Code.platform] error.
@@ -121,6 +141,19 @@ internal class KeyStoreAdapter(private val store: KeyStore) : MobileKeyStore {
     override fun deleteKey(id: String) = store.deleteKey(id)
 
     override fun durable(): Boolean = store.isDurable
+}
+
+/**
+ * A KeyAgreement as gomobile's: a key that can't agree keys is marked
+ * so Go signs instead.
+ */
+internal class KeyAgreementAdapter(private val agreement: KeyAgreement) : MobileKeyAgreement {
+    override fun agree(id: String, peerPublicKey: ByteArray): ByteArray =
+        try {
+            agreement.agree(id, peerPublicKey)
+        } catch (e: KeyAgreementUnsupportedException) {
+            throw StoreException("[no_key_agreement] " + (e.message ?: "unsupported"))
+        }
 }
 
 /** A CredentialStore as gomobile's CredentialStore. */
