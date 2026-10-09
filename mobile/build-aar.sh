@@ -1,11 +1,17 @@
 #!/bin/sh
 # Builds the Go "mobile" package with gomobile bind into an Android
 # library (AAR) for arm64 and x86_64 (the emulator). 32-bit arm is left
-# out: Play requires 64-bit libraries, and a 32-bit one would only add
-# size:
+# out by default: Play requires 64-bit libraries, and a 32-bit one would
+# only add size:
 #
 #   ./build-aar.sh                   → build/release/mobile.aar
 #   ./build-aar.sh -tags mobiletest  → build/test/mobile.aar
+#
+# An app that still ships 32-bit (abiFilters with armeabi-v7a or x86)
+# needs the library for those ABIs too, or it fails to load there:
+# ANDROID_TARGETS replaces the targets.
+#
+#   ANDROID_TARGETS=android/arm,android/arm64,android/386,android/amd64 ./build-aar.sh
 #
 # The test build carries an in-process test issuer and Verifier
 # (TestEnv) that a shipped library must not have; the Kotlin library
@@ -20,6 +26,7 @@ set -eu
 cd "$(dirname "$0")"
 : "${ANDROID_HOME:=${ANDROID_SDK_ROOT:-$HOME/Library/Android/sdk}}"
 export ANDROID_HOME
+: "${ANDROID_TARGETS:=android/arm64,android/amd64}"
 GOBIN="$PWD/build/bin" go install golang.org/x/mobile/cmd/gomobile golang.org/x/mobile/cmd/gobind
 OUT=build/release
 case " $* " in *" -tags mobiletest "*) OUT=build/test ;; esac
@@ -27,7 +34,7 @@ rm -f "$OUT/mobile.aar" "$OUT/mobile-sources.jar"
 mkdir -p "$OUT"
 # -androidapi matches the Kotlin library's minSdk (26).
 PATH="$PWD/build/bin:$PATH" gomobile bind \
-	-target=android/arm64,android/amd64 -androidapi=26 \
+	-target="$ANDROID_TARGETS" -androidapi=26 \
 	-javapkg=dev.idfoundry.oid4vcwallet.gomobile \
 	-trimpath -ldflags="-s -w" "$@" \
 	-o "$OUT/mobile.aar" .

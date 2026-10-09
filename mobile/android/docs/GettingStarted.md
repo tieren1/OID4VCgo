@@ -30,6 +30,11 @@ x86_64 (the emulator). It needs Android 8.0 (API 26); holder keys that
 ask for the holder's fingerprint or screen lock each time need Android
 11 (API 30).
 
+An app that still ships 32-bit ABIs (`abiFilters` with `armeabi-v7a` or
+`x86`) builds the AAR with them too, or the library fails to load on a
+32-bit-only device:
+`ANDROID_TARGETS=android/arm,android/arm64,android/386,android/amd64 mobile/build-aar.sh`.
+
 ## Register the wallet
 
 Issuers' Authorization Servers know the wallet as an OAuth client: a

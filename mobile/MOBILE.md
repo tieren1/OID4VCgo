@@ -736,8 +736,11 @@ on an emulator, in CI too (`mobile-android`).
   aligned, as Google Play requires, by the NDK's default.
 - **No 32-bit arm:** FAPIgo didn't build where `int` is 32 bits
   (`math.MaxUint32` overflowed `int` in its `internal/jwe`) until
-  v0.51.0, which fixed it. The AAR still leaves 32-bit arm out: Play
-  requires the 64-bit libraries, and a 32-bit one would only add size.
+  v0.51.0, which fixed it. The AAR still leaves 32-bit arm out by
+  default: Play requires the 64-bit libraries, and a 32-bit one would
+  only add size. `ANDROID_TARGETS` adds `android/arm` and `android/386`
+  for an app that still ships them; each adds about 9 MB, and their
+  segments are 4 KB aligned (16 KB pages are a 64-bit requirement).
   iOS never had a 32-bit target.
 - **One library:** the AAR's Java bindings are in
   `dev.idfoundry.oid4vcwallet.gomobile` (`-javapkg`), but gomobile's own
